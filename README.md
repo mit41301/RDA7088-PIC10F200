@@ -3,4 +3,6 @@ PIC10F200 assembly code for RDA7088 I2S FM tuner
 
 MPLAB IDE 8.92
 
+MPASM  5.51
+
 44.1ksps 16 bit signed audio 
