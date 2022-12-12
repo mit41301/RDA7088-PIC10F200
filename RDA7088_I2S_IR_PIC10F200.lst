@@ -1,0 +1,612 @@
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  1
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00001 ;*******************************************************************************
+                      00002 ; FILE:      PIC10F200+RDA7088+IR+I2S.asm                                      *
+                      00003 ; CONTENTS:  RDA7088N + I²C + I²S + NEC IR REMOTE Control                      *
+                      00004 ; EDITOR:    mit41301                                                          *
+                      00005 ; UPDATED:   12/12/22                                                          *
+                      00006 ;*******************************************************************************
+                      00007  include "p10F200.inc"
+                      00001         LIST
+                      00002 
+                      00003 ;==========================================================================
+                      00004 ;  MPASM PIC10F200 processor include
+                      00005 ; 
+                      00006 ;  (c) Copyright 1999-2013 Microchip Technology, All rights reserved
+                      00007 ;==========================================================================
+                      00008 
+                      00151         LIST
+                      00008  list    p=10F200
+                      00009 
+0100   000F 0002 0000 00010  __idlocs H'F200'
+       0000 
+0FFF   0FEB           00011  __CONFIG _MCLRE_OFF & _CP_OFF & _WDT_OFF;
+                      00012 ; __CONFIG H'0FEB'
+                      00013 
+                      00014 ;*******************************************************************************
+                      00015 ; File register usage                                                          *
+                      00016 ;*******************************************************************************
+                      00017 
+  00000010            00018 iRAM  set  h'10'
+                      00019 ;********************************************************************
+                      00020                 cblock iRAM     
+                      00021 ;********************************************************************
+  00000010            00022 i           ;EQU    010h    ;Delay variable
+  00000011            00023 j           ;EQU    011h    ;Delay variable
+  00000012            00024 bit_count   ;EQU    012h    ;Counter of processed bits in I2C
+  00000013            00025 i2c_data    ;EQU    013h    ;Data to receive/transmit via I2C
+  00000014            00026 port        ;EQU    014h    ;Helper register to implement I2C
+  00000015            00027 ack         ;EQU    015h    ;Acknowledgment received from the device
+  00000016            00028 volume      ;EQU    016h    ;Radio volume level
+  00000017            00029 frequency_l ;EQU    017h    ;Frequency low byte
+  00000018            00030 frequency_h ;EQU    018h    ;Frequency high byte
+                      00031 ;********************************************************************
+  00000019            00032 _count      ;EQU    019h    ;Saved value of the timer
+  0000001A            00033 _byte_count ;EQU    01Ah    ;Counter of processed bytes
+  0000001B            00034 _bit_count  ;EQU    01Bh    ;Counter of processed bits
+  0000001C            00035 _ir_data:4  ;EQU    01Ch    ;First IR byte
+                      00036 ;********************************************************************
+                      00037 
+  00000020            00038 RAM_            
+                      00039                 endc
+                      00040 
+                      00041         if RAM_ > H'020'
+                      00042         error "File register usage overflow"
+                      00043         endif
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  2
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+                      00044 ;###############################################################################
+  00000001            00045 SCL        EQU    GP1    ;SCL pin of the I²C Bus
+  00000002            00046 SDA        EQU    GP2    ;SDA pin of the I²C Bus
+  00000003            00047 IRx        EQU    GP3    ;INPUT ONLY PIN(IR Rx 38kHz)
+                      00048 ;###############################################################################
+                      00049 ;volume_init EQU 0x03 | 0x80; Initial Volume = 3 // [0..15]
+  00000083            00050 volume_init EQU 0x03 | 1<<7 ;0x80; Initial Volume = 3 // [0..15]
+                      00051 
+  00000397            00052 freq  EQU d'919'        ;   91.9 MHz
+                      00053 ;freq  EQU d'943'   ;   94.3 MHz
+                      00054 ;freq  EQU d'1040'      ;  104.0 MHz
+                      00055 
+                      00056 ;freqB EQU (freq - d'870') ; BAND = 0 : 87~108 MHz (US/Europe)
+  00000031            00057 freqB EQU (freq - 366)     ; BAND = 0 : 87~108 MHz (US/Europe)
+  0000000C            00058 freqH EQU (freqB >> 2)     ; Frequency = Channel Spacing(kHz) x CHAN + 87.0 MHz
+  00000040            00059 freqL EQU ((freqB&3) << 6) ; Shift channel selection for matching register 0x03
+                      00060         
+0000                  00061         ORG    0x00
+                      00062  
+0000   0EFE           00063     andlw   ~1
+0001   0025           00064     movwf   OSCCAL
+                      00065 
+0002                  00066 INIT:
+0002   0C97           00067     MOVLW  ~((1<<T0CS)|(1<<NOT_GPPU)|(1<<PSA))
+0003   0002           00068     OPTION                ;Enable GPIO2 and pull-ups
+                      00069 
+0004   0C0F           00070     MOVLW  0x0F           ;Save 0x0F into 'port' register
+0005   0034           00071     MOVWF  port           ;It's used to switch SDA/SCL pins direction
+0006   0006           00072     TRIS   GPIO           ;Set all pins as inputs
+                      00073 
+0007   0CFF           00074     MOVLW  0xFF           ;Perform 200 ms delay
+0008   0995           00075     CALL   DELAY          ;to let the power stabilize
+0009   0CFF           00076     MOVLW  0xFF           ;Perform 400 ms delay
+000A   0995           00077     CALL   DELAY          ;to let the power stabilize
+                      00078 
+000B   0066           00079     CLRF   GPIO           ;Clear GPIO to set all pins to 0
+                      00080 
+                      00081 ;DEFAULT STARTING:        ;Reading the stored data from EEPROM
+                      00082 
+000C   0C83           00083         movlw volume_init ;0x83
+000D   0C16           00084         movlw volume
+000E   0C40           00085         movlw freqL ;0x40 ;91.90 MHz
+000F   0037           00086         movwf frequency_l
+0010   0C0C           00087         movlw freqH ;0x0C ;91.90 MHz
+0011   0038           00088         movwf frequency_h
+                      00089 ;
+0012   0CC0           00090     MOVLW  0xC0           ;Implement AND operation between 0xC0
+0013   0177           00091     ANDWF  frequency_l, F ;and 'frequency_l' to clear its last 6 bits
+0014   0597           00092     BSF    frequency_l, 4 ;Set bit 4 (Tune) to adjust the frequency
+                      00093 
+                      00094 ;START_RADIO:              ;Start FM radio
+0015   0965           00095     CALL   I2C_START      ;Issue I2C Start condition
+0016   0C20           00096     MOVLW  0x20           ;Radio chip address for sequential writing is 0x20
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  3
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+0017   096C           00097     CALL   I2C_WRITE_BYTE ;Write the radio address via i2C
+0018   0CD0           00098     MOVLW  0xD0           ;Write high byte into radio register 0x02/ BASS BOOST EN 
+0019   096C           00099     CALL   I2C_WRITE_BYTE
+001A   0C01           00100     MOVLW  0x01           ;Write  low byte into radio register 0x02
+001B   096C           00101     CALL   I2C_WRITE_BYTE
+001C   0218           00102     MOVF   frequency_h, W ;Write high byte into radio register 0x03
+001D   096C           00103     CALL   I2C_WRITE_BYTE
+001E   0217           00104     MOVF   frequency_l, W ;Write  low byte into radio register 0x03
+001F   096C           00105     CALL   I2C_WRITE_BYTE
+                      00106 ;-----------------------------------------------------------------------------
+                      00107 ;          IV
+                      00108 ;-----------------------------------------------------------------------------
+0020   0C02           00109     MOVLW  b'00000010'    ;LOAD W Reg with 0x04 Register High byte 
+0021   096C           00110     CALL   I2C_WRITE_BYTE ;Write high byte into radio register 0x04
+0022   0C40           00111     MOVLW  b'01000000'    ;LOAD W Reg with 0x04 Register Low byte 
+0023   096C           00112     CALL   I2C_WRITE_BYTE ;Write high byte into radio register 0x04
+                      00113 ;-----------------------------------------------------------------------------
+                      00114 ;          V
+                      00115 ;-----------------------------------------------------------------------------
+0024   0C00           00116     MOVLW  b'00000000'    ;Write high byte into radio register 0x05
+0025   096C           00117     CALL   I2C_WRITE_BYTE
+0026   0C00           00118     MOVLW  b'00000000'    ;Write low byte into radio register 0x05
+0027   096C           00119     CALL   I2C_WRITE_BYTE
+                      00120 ;-----------------------------------------------------------------------------
+                      00121 ;          VI
+                      00122 ;-----------------------------------------------------------------------------
+0028   0C02           00123     MOVLW  b'00000010'    ;Write high byte into radio register 0x06
+0029   096C           00124     CALL   I2C_WRITE_BYTE
+002A   0C70           00125     MOVLW  b'01110000'    ;Write low byte into radio register 0x06
+002B   096C           00126     CALL   I2C_WRITE_BYTE
+                      00127 ;-----------------------------------------------------------------------------
+002C   0968           00128     CALL   I2C_STOP       ;Issue I2C Stop condition
+                      00129 ;=============================================================================
+                      00130 
+002D   0C0F           00131     MOVLW  0x0F           ;Implement AND operation between 0xC0
+002E   0176           00132     ANDWF  volume, F      ;and 'volume' to clear its higher 4 bits
+002F   05F6           00133     BSF    volume, 7      ;Set bit 7  to select correct LNA input
+0030   0A38           00134     GOTO   SET_VOLUME     ;And go to the 'SET_VOLUME' label
+                      00135 
+0031                  00136 LOOP:                     
+                      00137 
+0031                  00138 INCREASE_VOLUME:          ;Otherwise start 'INCREASE_VOLUME'
+0031   02B6           00139     INCF   volume, F      ;Increment the 'volume' register
+0032   0696           00140     BTFSC  volume, 4      ;If bit 4 becomes set (volume = 0b10010000)
+0033   00F6           00141     DECF   volume, F      ;then decrement the 'volume' to get 0b10001111
+0034   0A38           00142     GOTO   SET_VOLUME     ;and go to the 'SET_VOLUME' label
+0035                  00143 DECREASE_VOLUME:          ;Decrease the volume here
+0035   00F6           00144     DECF   volume, F      ;Decrement the 'volume' register
+0036   07F6           00145     BTFSS  volume, 7      ;If bit 7 becomes 0 (volume = 0b01111111)
+0037   02B6           00146     INCF   volume, F      ;then increment the 'volume' to get 0b10000000
+0038                  00147 SET_VOLUME:               ;Set the radio volume
+0038   0965           00148     CALL   I2C_START      ;Issue I2C start condition
+0039   0C22           00149     MOVLW  0x22           ;Radio chip address for random writing is 0x22
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  4
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+003A   096C           00150     CALL   I2C_WRITE_BYTE ;Write the radio address via I2C
+003B   0C05           00151     MOVLW  0x05           ;Set the register number to write to (0x05)
+003C   096C           00152     CALL   I2C_WRITE_BYTE ;And write it via I2C
+003D   0C88           00153     MOVLW  0x88           ;Set the high byte of 0x05 register (default value)
+003E   096C           00154     CALL   I2C_WRITE_BYTE ;And write it via i2C
+003F   0216           00155     MOVF   volume, W      ;Set the 'volume' as low byte of 0x05 register
+0040   096C           00156     CALL   I2C_WRITE_BYTE ;And write it via I2C
+0041   0968           00157     CALL   I2C_STOP       ;Issue Stop condition
+                      00158 
+0042   0A9C           00159     GOTO   _LOOP           ;And return to the 'LOOP' label
+                      00160 
+                      00161 ;CHANNEL_SEEK:             ;CHANNEL_SEEK up | down
+                      00162 
+0043                  00163 CH_UP:
+0043   0965           00164     CALL   I2C_START      ;Issue I2C Start condition
+0044   0C20           00165     MOVLW  0x20           ;Radio chip address for sequential writing is 0x20
+0045   096C           00166     CALL   I2C_WRITE_BYTE ;Write the radio address via I2C
+                      00167 
+0046   0CC3           00168     MOVLW  0xC3           ;Otherwise set 0xC3 as high byte of 0x02 register
+0047   096C           00169     CALL   I2C_WRITE_BYTE ;And write it via I2C
+0048   0C01           00170     MOVLW  0x01           ;Set 0x01 as low byte of 0x02 register
+0049   096C           00171     CALL   I2C_WRITE_BYTE ;And write it via I2C
+004A   0968           00172     CALL   I2C_STOP       ;Issue I2C Stop condition
+004B   0A9C           00173     GOTO   _LOOP           ;And return to the '_LOOP' labe;
+                      00174 
+004C                  00175 SEEK_DOWN:                ;Seek the station down
+                      00176 
+004C   0965           00177     CALL   I2C_START      ;ADDEDIssue I2C Start condition
+004D   0C20           00178     MOVLW  0x20           ;ADDEDRadio chip address for sequential writing is 0x20
+004E   096C           00179     CALL   I2C_WRITE_BYTE ;ADDEDWrite the radio address via I2C
+                      00180 
+004F   0CC1           00181     MOVLW  0xC1           ;Set 0xC1 as high byte of 0x02 register
+0050   096C           00182     CALL   I2C_WRITE_BYTE ;Ending of previous transaction
+0051   0C01           00183     MOVLW  0x01           ;Set 0x01 as low byte of 0x02 register
+0052   096C           00184     CALL   I2C_WRITE_BYTE ;And write it via I2C
+0053   0968           00185     CALL   I2C_STOP       ;Issue I2C Stop condition
+0054   0A9C           00186     GOTO   _LOOP           ;And return to the '_LOOP' labe;
+                      00187 
+                      00188 ;-------------Helper subroutines---------------------------------------------
+0055                  00189 SDA_HIGH:                 ;Set SDA pin high
+0055   0554           00190     BSF    port, SDA      ;Set 'sda' bit in the 'port' to make it input
+0056   0214           00191     MOVF   port, W        ;Copy 'port' into W register
+0057   0006           00192     TRIS   GPIO           ;And set it as TRISGPIO value
+0058   0800           00193     RETLW  0
+                      00194 
+0059                  00195 SDA_LOW:                  ;Set SDA pin low
+0059   0454           00196     BCF    port, SDA      ;Reset 'sda' bit in the 'port' to make it output
+005A   0214           00197     MOVF   port, W        ;Copy 'port' into W register
+005B   0006           00198     TRIS   GPIO           ;And set it as TRISGPIO value
+005C   0800           00199     RETLW  0
+                      00200 
+005D                  00201 SCL_HIGH:                 ;Set SCL pin high
+005D   0534           00202     BSF    port, SCL      ;Set 'scl' bit in the 'port' to make it input
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  5
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+005E   0214           00203     MOVF   port, W        ;Copy 'port' into W register
+005F   0006           00204     TRIS   GPIO           ;And set it as TRISGPIO value
+0060   0800           00205     RETLW  0
+                      00206 
+0061                  00207 SCL_LOW:                  ;Set SCL pin low
+0061   0434           00208     BCF    port, SCL      ;Reset 'scl' bit in the 'port' to make it output
+0062   0214           00209     MOVF   port, W        ;Copy 'port' into W register
+0063   0006           00210     TRIS   GPIO           ;And set it as TRISGPIO value
+0064   0800           00211     RETLW  0
+                      00212 ;-------------I2C start condition--------------
+0065                  00213 I2C_START:
+0065   095D           00214     CALL   SCL_HIGH       ;Set SCL high
+0066   0959           00215     CALL   SDA_LOW        ;Then set SDA low
+0067   0800           00216     RETLW  0
+                      00217 ;-------------I2C stop condition---------------
+0068                  00218 I2C_STOP:
+0068   0959           00219     CALL   SDA_LOW        ;Set SDA low
+0069   095D           00220     CALL   SCL_HIGH       ;Set SCL high
+006A   0955           00221     CALL   SDA_HIGH       ;Then set SDA highs and release the bus
+006B   0800           00222     RETLW  0
+                      00223 ;------------I2C write byte--------------------
+006C                  00224 I2C_WRITE_BYTE:
+006C   0033           00225     MOVWF  i2c_data       ;Load 'i2c_data' from W register
+006D   0C08           00226     MOVLW  8              ;Load value 8 into 'bit_count'
+006E   0032           00227     MOVWF  bit_count      ;to indicate we're going to send 8 bits
+006F                  00228 I2C_WRITE_BIT:            ;Write single bit to I2C
+006F   0961           00229     CALL   SCL_LOW        ;Set SCL low, now we can change SDA
+0070   07F3           00230     BTFSS  i2c_data, 7    ;Check the MSB of 'i2c_data'
+0071   0A74           00231     GOTO   I2C_WRITE_0    ;If it's 0 then go to the 'I2C_WRITE_0' label
+0072                  00232 I2C_WRITE_1:              ;Else continue with 'I2C_WRITE_1'
+0072   0955           00233     CALL   SDA_HIGH       ;Set SDA high
+0073   0A75           00234     GOTO   I2C_SHIFT      ;And go to the 'I2C_SHIFT' label
+0074                  00235 I2C_WRITE_0:
+0074   0959           00236     CALL   SDA_LOW        ;Set SDA low
+0075                  00237 I2C_SHIFT:
+0075   095D           00238     CALL   SCL_HIGH       ;Set SCL high to start the new pulse
+0076   0373           00239     RLF    i2c_data, F    ;Shift 'i2c_data' one bit to the left
+0077   02F2           00240     DECFSZ bit_count, F   ;Decrement the 'bit_count' value, check if it's 0
+0078   0A6F           00241     GOTO   I2C_WRITE_BIT  ;If not then return to the 'I2C_WRITE_BIT'
+0079                  00242 I2C_CHECK_ACK:            ;Else check the acknowledgement bit
+0079   0961           00243     CALL   SCL_LOW        ;Set I2C low to end the last pulse
+007A   0955           00244     CALL   SDA_HIGH       ;Set SDA high to release the bus
+007B   095D           00245     CALL   SCL_HIGH       ;Set I2C high to start the new pulse
+007C   0206           00246     MOVF   GPIO, W        ;Copy the GPIO register value into the 'ack'
+007D   0035           00247     MOVWF  ack            ;Now bit 'sda' of the 'ack' will contain ACK bit
+007E   0961           00248     CALL   SCL_LOW        ;Set SCL low to end the acknowledgement bit
+007F   0800           00249     RETLW  0
+                      00250 ;------------I2C read byte--------------------
+0080                  00251 I2C_READ_BYTE:
+0080   0C08           00252     MOVLW  8              ;Load value 8 into 'bit_count'
+0081   0032           00253     MOVWF  bit_count      ;to indicate we're going to receive 8 bits
+0082   0073           00254     CLRF   i2c_data       ;Clear the 'i2c_data' register
+0083                  00255 I2C_READ_BIT:             ;Read single bit from the I2C
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  6
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+0083   0373           00256     RLF    i2c_data, F    ;Shift the 'i2c_data' register one bit to the left
+0084   0961           00257     CALL   SCL_LOW        ;Set SCL low to prepare for the new bit
+0085   095D           00258     CALL   SCL_HIGH       ;Set SCL high to read the bit value
+0086   0646           00259     BTFSC  GPIO, SDA      ;Check the 'sda' bit in the GPIO register
+0087   0513           00260     BSF    i2c_data, 0    ;if it's 1 then set the LSB of the 'i2c_data'
+0088   02F2           00261     DECFSZ bit_count, F   ;Decrement the 'bit_count' value, check if it's 0
+0089   0A83           00262     GOTO   I2C_READ_BIT   ;If not, then return to the 'I2C_READ_BIT'
+008A   0961           00263     CALL   SCL_LOW        ;Set SCL low to end the last pulse
+008B   0800           00264     RETLW  0              ;Otherwise return from the subroutine
+                      00265 ;----------I2C send ACK----------------------
+008C                  00266 I2C_ACK:
+008C   0959           00267     CALL   SDA_LOW        ;Set SDA low to issue ACK condition
+008D   095D           00268     CALL   SCL_HIGH       ;Set SCL high to start the new pulse
+008E   0961           00269     CALL   SCL_LOW        ;Set SCL low to end the pulse
+008F   0955           00270     CALL   SDA_HIGH       ;Set SDA high to release the bus
+0090   0800           00271     RETLW  0
+                      00272 ;----------I2C send NACK----------------------
+0091                  00273 I2C_NACK:
+0091   0955           00274     CALL   SDA_HIGH       ;Set SDA low to issue NACK condition
+0092   095D           00275     CALL   SCL_HIGH       ;Set SCL high to start the new pulse
+0093   0961           00276     CALL   SCL_LOW        ;Set SCL low to end the pulse
+0094   0800           00277     RETLW  0
+                      00278 ;-------------Delay subroutine--------------
+0095                  00279 DELAY:                    ;Start DELAY subroutine here  
+0095   0030           00280     MOVWF  i              ;Copy the value to the register i
+0096   0031           00281     MOVWF  j              ;Copy the value to the register j
+0097                  00282 DELAY_LOOP:               ;Start delay loop
+0097   02F0           00283     DECFSZ i, F           ;Decrement i and check if it is not zero
+0098   0A97           00284     GOTO   DELAY_LOOP     ;If not, then go to the DELAY_LOOP label
+0099   02F1           00285     DECFSZ j, F           ;Decrement j and check if it is not zero
+009A   0A97           00286     GOTO   DELAY_LOOP     ;If not, then go to the DELAY_LOOP label
+009B   0800           00287     RETLW  0              ;Else return from the subroutine
+                      00288 ;##############################################################################
+                      00289 ;---IR REMOTE CONTROL 38kHz ROUTINE--------------------------------------------
+                      00290 ;##############################################################################
+009C                  00291 _LOOP:                    ;Main loop of the program
+                      00292 ;---------------Wait for the preamble positive pulse---------------------
+009C   0666           00293     BTFSC GPIO, IRx       ;Wait while 'ir' pin goes down
+009D   0A9C           00294     GOTO _LOOP           ;If it's high then return to 'LOOP'
+009E   0061           00295     CLRF  TMR0           ;Otherwise clear the timer register
+009F   0766           00296     BTFSS GPIO, IRx       ;And wait while 'ir' is low
+00A0   0A9F           00297     GOTO  $-1
+00A1   0201           00298     MOVF  TMR0, W        ;Copy the TMR0 value into the W register
+00A2   0039           00299     MOVWF _count         ;and save the value into the 'count' register
+00A3   0C1E           00300     MOVLW d'30'          ;Load 30 into W (256 us x 32 = 7.7 ms)
+00A4   0099           00301     SUBWF _count, W      ;And subtract W from 'count'
+00A5   0703           00302     BTFSS STATUS, C      ;If 'count' < 30 (pulse is shorter than 7.7 ms)
+00A6   0A9C           00303     GOTO  _LOOP          ;then return to 'LOOP'
+00A7   0C2D           00304     MOVLW d'45'          ;Load 45 into W (256 us x 45 = 11.5 ms)
+00A8   0099           00305     SUBWF _count, W      ;And subtract W from 'count'
+00A9   0603           00306     BTFSC STATUS, C      ;If 'count' > 45 (pulse is longer than 8 ms)
+00AA   0A9C           00307     GOTO _LOOP           ;then return to 'LOOP'
+                      00308 ;---------------Check the preamble negative pulse---------------------
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  7
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+00AB   0061           00309     CLRF TMR0            ;Otherwise clear the timer register
+00AC   0666           00310     BTFSC GPIO, IRx       ;And wait while 'ir' is high
+00AD   0AAC           00311     GOTO $-1
+00AE   0201           00312     MOVF TMR0, W         ;Copy the TMR0 value into the W register
+00AF   0039           00313     MOVWF _count         ;and save the value into the 'count' register
+00B0   0C0D           00314     MOVLW d'13'          ;Load 15 into W (256 us x 13 = 3.3 ms)
+00B1   0099           00315     SUBWF _count, W      ;And subtract W from 'count'
+00B2   0703           00316     BTFSS STATUS, C      ;If 'count' < 13 (pulse is shorter than 3.3 ms)
+00B3   0A9C           00317     GOTO _LOOP           ;then return to 'LOOP'
+00B4   0C14           00318     MOVLW d'20'          ;Load 20 into W (256 us x 20 = 5.1 ms)
+00B5   0099           00319     SUBWF _count, W      ;And subtract W from 'count'
+00B6   0603           00320     BTFSC STATUS, C      ;If 'count' > 20 (pulse is longer than 5.1 ms)
+00B7   0A9C           00321     GOTO _LOOP           ;then return to 'LOOP'
+                      00322 ;---------------Receive the command bytes-----------------------------
+00B8   007A           00323     CLRF _byte_count     ;Clear the 'byte_count' register    
+00B9   0C1C           00324     MOVLW _ir_data       ;Load the address of the 'ir_data' into W
+00BA   0024           00325     MOVWF FSR            ;and save it to the indirect pointer register
+00BB                  00326 _RECEIVE_BYTE:
+00BB   007B           00327     CLRF _bit_count      ;Clear the 'bit_count' register
+00BC   0060           00328     CLRF INDF            ;Clear the indirectly addressed register
+00BD                  00329 _RECEIVE_BIT:
+00BD   0320           00330     RRF INDF, F          ;Shift the INDF register to the right
+                      00331 ;---------------Receive the positive pulse of the bit-----------------
+00BE   0061           00332     CLRF TMR0           ;Otherwise clear the timer register
+00BF   0766           00333     BTFSS GPIO, IRx      ;And wait while 'ir' is low
+00C0   0ABF           00334     GOTO $-1
+00C1   0201           00335     MOVF TMR0, W        ;Copy the TMR0 value into the W register
+00C2   0039           00336     MOVWF _count         ;and save the value into the 'count' register
+00C3   0C01           00337     MOVLW 1             ;Load 1 into W (256 us x 1 = 0.26 ms)
+00C4   0099           00338     SUBWF _count, W      ;And subtract W from 'count'
+00C5   0703           00339     BTFSS STATUS, C     ;If 'count' < 1 (pulse is shorter than 0.26 ms)
+00C6   0A9C           00340     GOTO _LOOP           ;then return to 'LOOP'
+00C7   0C03           00341     MOVLW 3             ;Load 3 into W (256 us x 3 = 0.77 ms)
+00C8   0099           00342     SUBWF _count, W      ;And subtract W from 'count'
+00C9   0603           00343     BTFSC STATUS, C     ;If 'count' > 3 (pulse is longer than 0.77 ms)
+00CA   0A9C           00344     GOTO _LOOP           ;then return to 'LOOP'
+                      00345 ;---------------Receive the negative pulse of the bit-----------------
+00CB   0061           00346     CLRF TMR0           ;Otherwise clear the timer register
+00CC   0666           00347     BTFSC GPIO, IRx     ;And wait while 'ir' is high
+00CD   0ACC           00348     GOTO $-1
+00CE   0201           00349     MOVF TMR0, W        ;Copy the TMR0 value into the W register
+00CF   0039           00350     MOVWF _count        ;and save the value into the 'count' register
+00D0   0C04           00351     MOVLW 4;/////////// ;Load 5 into W (256 us x 4 = 1.1 ms)
+00D1   0099           00352     SUBWF _count, W      ;And subtract W from 'count'
+00D2   0703           00353     BTFSS STATUS, C     ;If 'count' < 4 (pulse is shorter than 1.1 ms)
+00D3   0AD9           00354     GOTO _NEXT_BIT       ;then go to the 'NEXT_BIT' label
+00D4   0C08           00355     MOVLW 8             ;Load 8 into W (256 us x 8 = 2 ms)
+00D5   0099           00356     SUBWF _count, W      ;And subtract W from 'count'
+00D6   0603           00357     BTFSC STATUS, C     ;If 'count' > 8 (pulse is longer than 2 ms)
+00D7   0A9C           00358     GOTO  _LOOP         ;then go to the 'LOOP' label
+00D8   05E0           00359     BSF   INDF, 7       ;Set the MSB of the INDF register
+00D9                  00360 _NEXT_BIT:
+00D9   02BB           00361     INCF _bit_count, F   ;Increment the 'bit_count' register
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  8
+
+
+LOC  OBJECT CODE     LINE SOURCE TEXT
+  VALUE
+
+00DA   077B           00362     BTFSS _bit_count, 3  ;Check if 'bit_count' becomes 8
+00DB   0ABD           00363     GOTO _RECEIVE_BIT    ;If it's not, then return to 'RECEIVE_BIT' label
+00DC   02BA           00364     INCF _byte_count, F  ;Increment the 'byte_count' register
+00DD   065A           00365     BTFSC _byte_count, 2 ;Check if 'byte_count' becomes 4    
+00DE   0AE1           00366     GOTO _CHECK_DATA     ;If it is then go to 'CHECK_DATA' label
+00DF   02A4           00367     INCF FSR, F          ;Increment the indirect addressing pointer
+00E0   0ABB           00368     GOTO _RECEIVE_BYTE   ;and go to 'RECEIVE_BYTE' label
+                      00369 
+00E1                  00370 _CHECK_DATA:
+00E1   025D           00371     COMF _ir_data+1, W   ;Negate the second received byte
+00E2   019C           00372     XORWF _ir_data, W    ;And implement the XOR between 1st and 2nd bytes
+00E3   0743           00373     BTFSS STATUS, Z      ;If the result is not 0 (bytes are not equal)
+00E4   0A9C           00374     GOTO _LOOP           ;Then return to the 'LOOP' label
+00E5   025F           00375     COMF _ir_data+3, W   ;Negate the fourth received byte
+00E6   019E           00376     XORWF _ir_data+2, W  ;And implement the XOR between 3rd and 4th bytes
+00E7   0743           00377     BTFSS STATUS, Z      ;If the result is not 0 (bytes are not equal)
+00E8   0A9C           00378     GOTO _LOOP           ;Then return to the 'LOOP' label
+                      00379 
+00E9   0C05           00380     MOVLW 0x05           ;Check the VOL- button (code 0x05)
+00EA   019E           00381     XORWF _ir_data+2, W  ;If command is not 0x05
+00EB   0743           00382     BTFSS STATUS, Z
+00EC   0AEE           00383     GOTO $+2             ;then skip the next line
+00ED   0A35           00384         goto DECREASE_VOLUME
+                      00385 
+00EE   0C06           00386     MOVLW 0x06           ;Check the VOL+ button (code 0x06)
+00EF   019E           00387     XORWF _ir_data+2, W  ;If command is not 0x06
+00F0   0743           00388     BTFSS STATUS, Z
+00F1   0AF3           00389     GOTO $+2             ;then skip the next line
+00F2   0A31           00390         goto INCREASE_VOLUME
+                      00391 
+00F3   0C02           00392     MOVLW 0x02           ;Check the << CH- button (code 0x02)
+00F4   019E           00393     XORWF _ir_data+2, W  ;If command is not 0x02
+00F5   0743           00394     BTFSS STATUS, Z
+00F6   0AF8           00395     GOTO $+2             ;then skip the next line
+00F7   0A4C           00396         goto SEEK_DOWN 
+                      00397 
+00F8   0C03           00398     MOVLW 0x03           ;Check the W button (code 0x03)
+00F9   019E           00399     XORWF _ir_data+2, W  ;If command is not 0x03
+00FA   0743           00400     BTFSS STATUS, Z
+00FB   0AFD           00401     GOTO $+2    ;$+2   ;then skip the next three lines
+00FC   0A43           00402         goto CH_UP ;////////////////////////
+                      00403 
+00FD   0A9C           00404     GOTO _LOOP           ;and go to the 'SET_OUTPUT' label
+                      00405 
+                      00406     END                   ;/* END of the Program */
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE  9
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+C                                 00000000
+CAL0                              00000001
+CAL1                              00000002
+CAL2                              00000003
+CAL3                              00000004
+CAL4                              00000005
+CAL5                              00000006
+CAL6                              00000007
+CH_UP                             00000043
+DC                                00000001
+DECREASE_VOLUME                   00000035
+DELAY                             00000095
+DELAY_LOOP                        00000097
+F                                 00000001
+FOSC4                             00000000
+FSR                               00000004
+GP0                               00000000
+GP1                               00000001
+GP2                               00000002
+GP3                               00000003
+GPIO                              00000006
+GPWUF                             00000007
+I2C_ACK                           0000008C
+I2C_CHECK_ACK                     00000079
+I2C_NACK                          00000091
+I2C_READ_BIT                      00000083
+I2C_READ_BYTE                     00000080
+I2C_SHIFT                         00000075
+I2C_START                         00000065
+I2C_STOP                          00000068
+I2C_WRITE_0                       00000074
+I2C_WRITE_1                       00000072
+I2C_WRITE_BIT                     0000006F
+I2C_WRITE_BYTE                    0000006C
+INCREASE_VOLUME                   00000031
+INDF                              00000000
+INIT                              00000002
+IRx                               00000003
+LOOP                              00000031
+NOT_GPPU                          00000006
+NOT_GPWU                          00000007
+NOT_PD                            00000003
+NOT_TO                            00000004
+OSCCAL                            00000005
+PCL                               00000002
+PS0                               00000000
+PS1                               00000001
+PS2                               00000002
+PSA                               00000003
+RAM_                              00000020
+SCL                               00000001
+SCL_HIGH                          0000005D
+SCL_LOW                           00000061
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE 10
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+SDA                               00000002
+SDA_HIGH                          00000055
+SDA_LOW                           00000059
+SEEK_DOWN                         0000004C
+SET_VOLUME                        00000038
+STATUS                            00000003
+T0CS                              00000005
+T0SE                              00000004
+TMR0                              00000001
+TRISIO0                           00000000
+TRISIO1                           00000001
+TRISIO2                           00000002
+TRISIO3                           00000003
+W                                 00000000
+Z                                 00000002
+_CHECK_DATA                       000000E1
+_CONFIG                           00000FFF
+_CP_OFF                           00000FFF
+_CP_ON                            00000FF7
+_IDLOC0                           00000100
+_IDLOC1                           00000101
+_IDLOC2                           00000102
+_IDLOC3                           00000103
+_IntRC_OSC                        00000FFF
+_LOOP                             0000009C
+_MCLRE_OFF                        00000FEF
+_MCLRE_ON                         00000FFF
+_NEXT_BIT                         000000D9
+_OSC_IntRC                        00000FFF
+_RECEIVE_BIT                      000000BD
+_RECEIVE_BYTE                     000000BB
+_WDTE_OFF                         00000FFB
+_WDTE_ON                          00000FFF
+_WDT_OFF                          00000FFB
+_WDT_ON                           00000FFF
+__10F200                          00000001
+_bit_count                        0000001B
+_byte_count                       0000001A
+_count                            00000019
+_ir_data                          0000001C
+ack                               00000015
+bit_count                         00000012
+freq                              00000397
+freqB                             00000031
+freqH                             0000000C
+freqL                             00000040
+frequency_h                       00000018
+frequency_l                       00000017
+i                                 00000010
+i2c_data                          00000013
+iRAM                              00000010
+j                                 00000011
+port                              00000014
+MPASM  5.51      PIC10F200+RDA7088+IR+I2S.ASM   12-12-2022  11:47:09         PAGE 11
+
+
+SYMBOL TABLE
+  LABEL                             VALUE 
+
+volume                            00000016
+volume_init                       00000083
+
+
+MEMORY USAGE MAP ('X' = Used,  '-' = Unused)
+
+0000 : XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX
+0040 : XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX
+0080 : XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX
+00C0 : XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXX XXXXXXXXXXXXXX--
+0100 : XXXX------------ ---------------- ---------------- ----------------
+0FC0 : ---------------- ---------------- ---------------- ---------------X
+
+All other memory blocks unused.
+
+Program Memory Words Used:   254
+Program Memory Words Free:     2
+
+
+Errors   :     0
+Warnings :     0 reported,     0 suppressed
+Messages :     0 reported,     0 suppressed
+
+
