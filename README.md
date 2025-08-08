@@ -1,3 +1,9 @@
+;###############################################################################
+SCL        EQU    GP1    ;SCL pin of the I²C Bus
+SDA        EQU    GP2    ;SDA pin of the I²C Bus
+IRx        EQU    GP3    ;INPUT ONLY PIN(IR Rx 38kHz)
+;###############################################################################
+
 # RDA7088-PIC10F200
 PIC10F200 assembly code for RDA7088 I2S FM tuner 
 
