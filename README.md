@@ -1,11 +1,11 @@
 
-SCL        EQU    GP1    ;SCL pin of the I²C Bus
+SCL        -    GP1    ;SCL pin of the I²C Bus
 
 
-SDA        EQU    GP2    ;SDA pin of the I²C Bus
+SDA        -    GP2    ;SDA pin of the I²C Bus
 
 
-IRx        EQU    GP3    ;Remote control input 38kHz
+IRx        -    GP3    ;Remote control input 38kHz
 
 
 # RDA7088-PIC10F200
